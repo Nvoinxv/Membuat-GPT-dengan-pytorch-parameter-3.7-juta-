@@ -1,29 +1,68 @@
+"""
+Modul Evaluasi dan Generasi Teks Model GPT.
+
+Fungsionalitas:
+- Pemuatan checkpoint model terbaik dan kosakata BPE yang telah dilatih
+- Pengujian perplexity pada sampel data teks
+- Generasi teks autoregresif dengan top-k sampling dan kendali temperatur
+- Mode interaktif untuk pengujian prompt khusus dari pengguna
+"""
+
+import math
+import os
+import logging
 import torch
 import numpy as np
+
 from Chat_Gpt.models.transfomers import membuat_gpt
 from Chat_Gpt.utils.bpe import BPE
 
-# Konfigurasi (harus sama dengan train.py)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger("GPT_Evaluator")
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHAT_GPT_DIR = os.path.dirname(CURRENT_DIR)
+
+DATA_PATH = os.path.join(CHAT_GPT_DIR, "data", "input.txt")
+CHECKPOINT_PATH = os.path.join(CHAT_GPT_DIR, "checkpoints", "best_model.pt")
+VOCAB_PATH = os.path.join(CHAT_GPT_DIR, "checkpoints", "vocab.json")
+
+# Hiperparameter Arsitektur (Harus konsisten dengan pelatihan)
 VOCAB_SIZE = 20000
 D_MODEL = 128
 SEQ_LEN = 128
 N_LAYERS = 6
 N_HEADS = 8
 D_FF = 512
-DROPOUT = 0.15
+DROPOUT = 0.1
 
-# Path ke checkpoint dan data
-CHECKPOINT_PATH = r"D:\Chatgpt_Pytorch\best_balanced_model.pt"
-DATA_PATH = r"D:\Chatgpt_Pytorch\Chat_Gpt\data\input.txt"
 
-def load_model_and_tokenizer():
-    """Load model dan tokenizer dari checkpoint"""
-    print(f"🔄 Loading model dari: {CHECKPOINT_PATH}")
-    
-    # Inisialisasi model dengan arsitektur yang sama
+def load_model_and_tokenizer() -> tuple:
+    """Memuat model dari checkpoint terbaik beserta tokenizer BPE yang bersesuaian."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        raise FileNotFoundError(f"Berkas checkpoint model tidak ditemukan di: {CHECKPOINT_PATH}. Harap jalankan pelatihan terlebih dahulu.")
+
+    bpe = BPE(max_tokens=VOCAB_SIZE)
+    if os.path.exists(VOCAB_PATH):
+        logger.info(f"Memuat kosakata BPE dari {VOCAB_PATH}...")
+        bpe.load_vocab(VOCAB_PATH)
+    elif os.path.exists(DATA_PATH):
+        logger.warning(f"Berkas kosakata tidak ditemukan di {VOCAB_PATH}. Melatih ulang BPE berdasarkan {DATA_PATH}...")
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            text_data = f.read()[:2000000]
+        bpe.fit(text_data)
+        os.makedirs(os.path.dirname(VOCAB_PATH), exist_ok=True)
+        bpe.save_vocab(VOCAB_PATH)
+    else:
+        raise FileNotFoundError("Baik berkas kosakata maupun berkas data tidak ditemukan.")
+
+    actual_vocab_size = bpe.get_vocab_size()
+
+    logger.info(f"Memuat bobot model dari {CHECKPOINT_PATH}...")
     model = membuat_gpt(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=actual_vocab_size,
         d_model=D_MODEL,
         n_layers=N_LAYERS,
         n_heads=N_HEADS,
@@ -31,292 +70,193 @@ def load_model_and_tokenizer():
         max_seq_len=SEQ_LEN,
         dropout=DROPOUT,
     ).to(DEVICE)
-    
-    # Load checkpoint
+
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    
-    # Load model state
-    if 'model_state_dict' in checkpoint:
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
         epoch = checkpoint.get('epoch', 'Unknown')
-        print(f"✅ Model loaded dari epoch: {epoch}")
+        val_loss = checkpoint.get('val_loss', 'N/A')
+        logger.info(f"Model berhasil dimuat (Epoch: {epoch}, Val Loss: {val_loss})")
     else:
-        # Jika checkpoint hanya berisi state_dict
         model.load_state_dict(checkpoint)
-        print(f"✅ Model di load dengan sangat lancar")
-    
+        logger.info("Model state dict berhasil dimuat secara langsung.")
+
     model.eval()
-    
-    # Load dan train tokenizer BPE dengan data yang sama
-    print(f"🔤 Loading dan training BPE tokenizer...")
-    with open(DATA_PATH, "r", encoding="utf-8") as f:
-        text_data = f.read()
-    
-    # Batasi data sama seperti training
-    if len(text_data) > 1000000:
-        text_data = text_data[:1000000]
-    
-    bpe = BPE(max_tokens=VOCAB_SIZE)
-    bpe.fit(text_data)
-    
-    print(f"✅ BPE tokenizer ready! Vocab size: {len(bpe.vocab)}")
-    
     return model, bpe
 
-def generate_text(model, bpe, prompt, max_length=100, temperature=0.8, top_k=50):
-    """Generate text dari prompt menggunakan model"""
+
+def generate_text(model: torch.nn.Module, bpe: BPE, prompt: str, max_length: int = 80, temperature: float = 0.8, top_k: int = 40) -> str:
+    """Menghasilkan teks berdasarkan prompt masukan menggunakan top-k sampling."""
     model.eval()
-    
-    # Tokenize prompt
+    temperature = max(temperature, 1e-5)
+
     tokens = bpe.encode(prompt)
-    tokens = [max(0, min(t, VOCAB_SIZE - 1)) for t in tokens]  # Clamp tokens
-    
-    # Convert ke tensor
-    input_ids = torch.tensor([tokens], dtype=torch.long).to(DEVICE)
-    
+    actual_vocab_size = bpe.get_vocab_size()
+    tokens = [max(0, min(t, actual_vocab_size - 1)) for t in tokens]
+
     generated_tokens = tokens.copy()
-    
-    print(f"\n📝 Generating text...")
-    print(f"Prompt: '{prompt}'")
-    print(f"{'='*60}")
-    
+
     with torch.no_grad():
         for _ in range(max_length):
-            # Ambil context window terakhir
-            if len(generated_tokens) > SEQ_LEN:
-                context = generated_tokens[-SEQ_LEN:]
-            else:
-                context = generated_tokens
-            
-            # Convert ke tensor
-            x = torch.tensor([context], dtype=torch.long).to(DEVICE)
-            x = torch.clamp(x, 0, VOCAB_SIZE - 1)
-            
-            # Forward pass
+            context = generated_tokens[-SEQ_LEN:] if len(generated_tokens) > SEQ_LEN else generated_tokens
+            x = torch.tensor([context], dtype=torch.long, device=DEVICE)
+
             logits = model(x)
-            
-            # Ambil logits untuk token terakhir
             logits = logits[0, -1, :] / temperature
-            
-            # Apply top-k sampling
+
             if top_k > 0:
-                top_k_logits, top_k_indices = torch.topk(logits, top_k)
+                top_k_logits, top_k_indices = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits = torch.full_like(logits, float('-inf'))
                 logits.scatter_(0, top_k_indices, top_k_logits)
-            
-            # Softmax dan sampling
+
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
-            
-            # Clamp token
-            next_token = max(0, min(next_token, VOCAB_SIZE - 1))
-            
+            next_token = max(0, min(next_token, actual_vocab_size - 1))
+
             generated_tokens.append(next_token)
-            
-            # Stop jika generate token tertentu (opsional)
-            # if next_token == bpe.vocab.get('<EOS>', -1):
-            #     break
-    
-    # Decode hasil
-    generated_text = bpe.decode(generated_tokens)
-    
-    return generated_text
 
-def test_multiple_samples():
-    """Test model dengan beberapa sample prompt"""
-    
-    # Load model dan tokenizer
-    model, bpe = load_model_and_tokenizer()
-    
-    # Daftar prompt untuk testing
-    test_prompts = [
-        "First Citizen:",
-        "MARCIUS:",
-        "First Officer:",
-        "Second Officer:",
-        "CORIOLANUS:"
-    ]
-    
-    print(f"\n{'='*60}")
-    print(f"🎯 EVALUASI MODEL - TESTING PREDIKSI")
-    print(f"{'='*60}\n")
-    
-    for i, prompt in enumerate(test_prompts, 1):
-        print(f"\n{'#'*60}")
-        print(f"TEST SAMPLE {i}/{len(test_prompts)}")
-        print(f"{'#'*60}")
-        
-        # Generate dengan parameter berbeda
-        generated = generate_text(
-            model=model,
-            bpe=bpe,
-            prompt=prompt,
-            max_length=100,      
-            temperature=0.6,     
-            top_k=40           
-        )
-        
-        print(f"\n📤 HASIL PREDIKSI:")
-        print(f"{'-'*60}")
-        print(generated)
-        print(f"{'-'*60}\n")
-    
-    print(f"\n{'='*60}")
-    print(f"✅ EVALUASI SELESAI!")
-    print(f"{'='*60}")
+    return bpe.decode(generated_tokens)
 
-def interactive_mode():
-    """Mode interaktif untuk testing custom prompt"""
-    
-    model, bpe = load_model_and_tokenizer()
-    
-    print(f"\n{'='*60}")
-    print(f"🎮 MODE INTERAKTIF - CUSTOM PROMPT")
-    print(f"{'='*60}")
-    print(f"Ketik 'exit' atau 'quit' untuk keluar\n")
-    
-    while True:
-        try:
-            prompt = input("\n💬 Masukkan prompt Anda: ")
-            
-            if prompt.lower() in ['exit', 'quit', 'keluar']:
-                print("👋 Terima kasih! Sampai jumpa!")
-                break
-            
-            if not prompt.strip():
-                print("⚠️ Prompt tidak boleh kosong!")
-                continue
-            
-            # Generate text
-            generated = generate_text(
-                model=model,
-                bpe=bpe,
-                prompt=prompt,
-                max_length=100,
-                temperature=0.8,
-                top_k=50
-            )
-            
-            print(f"\n📤 HASIL:")
-            print(f"{'-'*60}")
-            print(generated)
-            print(f"{'-'*60}")
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Program dihentikan. Sampai jumpa!")
-            break
-        except Exception as e:
-            print(f"❌ Error: {e}")
 
-def calculate_perplexity(model, bpe, text_sample):
-    """Hitung perplexity model pada sample text"""
+def calculate_perplexity(model: torch.nn.Module, bpe: BPE, text_sample: str) -> float:
+    """Menghitung nilai perplexity model terhadap sampel teks."""
     model.eval()
-    
-    # Tokenize
     tokens = bpe.encode(text_sample)
-    tokens = [max(0, min(t, VOCAB_SIZE - 1)) for t in tokens]
-    
+    actual_vocab_size = bpe.get_vocab_size()
+    tokens = [max(0, min(t, actual_vocab_size - 1)) for t in tokens]
+
     if len(tokens) < 2:
-        print("⚠️ Sample text terlalu pendek untuk perplexity")
-        return None
-    
-    # Calculate loss
-    total_loss = 0
+        logger.warning("Sampel teks terlalu pendek untuk evaluasi perplexity.")
+        return float('inf')
+
+    total_loss = 0.0
     count = 0
-    
+    criterion = torch.nn.CrossEntropyLoss()
+
     with torch.no_grad():
         for i in range(1, len(tokens)):
-            # Context
             start = max(0, i - SEQ_LEN + 1)
             context = tokens[start:i]
             target = tokens[i]
-            
-            # Convert ke tensor
-            x = torch.tensor([context], dtype=torch.long).to(DEVICE)
-            y = torch.tensor([target], dtype=torch.long).to(DEVICE)
-            
-            x = torch.clamp(x, 0, VOCAB_SIZE - 1)
-            y = torch.clamp(y, 0, VOCAB_SIZE - 1)
-            
-            # Forward pass
+
+            x = torch.tensor([context], dtype=torch.long, device=DEVICE)
+            y = torch.tensor([target], dtype=torch.long, device=DEVICE)
+
             logits = model(x)
-            
-            # Loss untuk token terakhir
-            criterion = torch.nn.CrossEntropyLoss()
             loss = criterion(logits[0, -1:, :], y)
-            
             total_loss += loss.item()
             count += 1
-    
-    avg_loss = total_loss / count
-    perplexity = np.exp(avg_loss)
-    
-    return perplexity
+
+    avg_loss = total_loss / max(1, count)
+    return math.exp(min(avg_loss, 20.0))
+
+
+def run_sample_evaluation():
+    """Menjalankan evaluasi otomatis pada serangkaian prompt uji."""
+    model, bpe = load_model_and_tokenizer()
+
+    test_prompts = [
+        "First Citizen:",
+        "MARCIUS:",
+        "Pada suatu hari",
+        "Kecerdasan buatan adalah",
+        "Machine learning"
+    ]
+
+    print("\n" + "=" * 70)
+    print("EVALUASI GENERASI TEKS OTOMATIS")
+    print("=" * 70)
+
+    for i, prompt in enumerate(test_prompts, 1):
+        print(f"\n[Pengujian {i}/{len(test_prompts)}] Prompt: '{prompt}'")
+        print("-" * 70)
+        output = generate_text(model, bpe, prompt, max_length=60, temperature=0.7, top_k=40)
+        print(output)
+        print("-" * 70)
+
 
 def run_perplexity_test():
-    """Test perplexity pada sample dari dataset"""
-    
+    """Menguji nilai perplexity pada korpus data yang tersedia."""
     model, bpe = load_model_and_tokenizer()
-    
-    # Load sample text
+
+    if not os.path.exists(DATA_PATH):
+        logger.error(f"Berkas data tidak ditemukan di {DATA_PATH} untuk uji perplexity.")
+        return
+
     with open(DATA_PATH, "r", encoding="utf-8") as f:
         text = f.read()
-    
-    # Ambil sample random
+
     sample_length = 500
-    start_idx = np.random.randint(0, max(1, len(text) - sample_length))
-    sample_text = text[start_idx:start_idx + sample_length]
-    
-    print(f"\n{'='*60}")
-    print(f"📊 PERPLEXITY TEST")
-    print(f"{'='*60}")
-    print(f"\nSample text:")
-    print(f"{'-'*60}")
-    print(sample_text[:200] + "...")
-    print(f"{'-'*60}")
-    
-    perplexity = calculate_perplexity(model, bpe, sample_text)
-    
-    if perplexity:
-        print(f"\n📈 Perplexity: {perplexity:.2f}")
-        print(f"   Lower is better! (<100 = good, <50 = excellent)")
-    
-    print(f"\n{'='*60}")
+    if len(text) > sample_length:
+        start_idx = np.random.randint(0, len(text) - sample_length)
+        sample_text = text[start_idx : start_idx + sample_length]
+    else:
+        sample_text = text
+
+    print("\n" + "=" * 70)
+    print("PENGUJIAN PERPLEXITY MODEL")
+    print("=" * 70)
+    print(f"Cuplikan Teks Uji: '{sample_text[:120]}...'")
+    ppl = calculate_perplexity(model, bpe, sample_text)
+    print("-" * 70)
+    print(f"Nilai Perplexity: {ppl:.2f} (Semakin rendah semakin baik)")
+    print("=" * 70)
+
+
+def interactive_mode():
+    """Menjalankan sesi interaktif untuk pengujian prompt masukan pengguna."""
+    model, bpe = load_model_and_tokenizer()
+
+    print("\n" + "=" * 70)
+    print("MODE INTERAKTIF GENERASI TEKS")
+    print("Ketik 'exit' atau 'keluar' untuk mengakhiri sesi.")
+    print("=" * 70)
+
+    while True:
+        try:
+            prompt = input("\n[Masukan Prompt] > ").strip()
+            if prompt.lower() in ["exit", "keluar", "quit"]:
+                print("[INFO] Sesi interaktif diakhiri.")
+                break
+            if not prompt:
+                print("[PERINGATAN] Prompt tidak boleh kosong.")
+                continue
+
+            print("-" * 70)
+            output = generate_text(model, bpe, prompt, max_length=80, temperature=0.8, top_k=40)
+            print(output)
+            print("-" * 70)
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Sesi diakhiri oleh pengguna.")
+            break
+        except Exception as e:
+            logger.error(f"Terjadi kesalahan saat generasi teks: {e}")
+
 
 if __name__ == "__main__":
-    print(f"\n{'='*60}")
-    print(f"🚀 EVALUASI MODEL GPT")
-    print(f"{'='*60}")
-    print(f"Device: {DEVICE}")
-    print(f"Checkpoint: {CHECKPOINT_PATH}")
-    print(f"\nPilih mode:")
-    print(f"1. Test dengan sample prompts otomatis")
-    print(f"2. Mode interaktif (custom prompt)")
-    print(f"3. Test perplexity")
-    print(f"4. Jalankan semua test")
-    
+    print("\n" + "=" * 70)
+    print("MENU EVALUASI MODEL GPT")
+    print("=" * 70)
+    print("1. Pengujian dengan prompt otomatis")
+    print("2. Mode interaktif (prompt khusus)")
+    print("3. Pengujian perplexity model")
+    print("4. Jalankan seluruh pengujian (1 & 3)")
+    print("=" * 70)
+
     try:
-        choice = input("\nPilihan Anda (1-4): ").strip()
-        
-        if choice == "1":
-            test_multiple_samples()
-        elif choice == "2":
+        pilihan = input("Pilih menu (1-4): ").strip()
+        if pilihan == "1":
+            run_sample_evaluation()
+        elif pilihan == "2":
             interactive_mode()
-        elif choice == "3":
+        elif pilihan == "3":
             run_perplexity_test()
-        elif choice == "4":
-            print("\n🔄 Menjalankan semua test...\n")
-            test_multiple_samples()
+        elif pilihan == "4":
+            run_sample_evaluation()
             run_perplexity_test()
-            print("\n🎮 Melanjutkan ke mode interaktif...")
-            interactive_mode()
         else:
-            print("❌ Pilihan tidak valid! Menjalankan mode default...")
-            test_multiple_samples()
-            
+            print("[INFO] Pilihan tidak dikenali. Menjalankan pengujian prompt otomatis...")
+            run_sample_evaluation()
     except KeyboardInterrupt:
-        print("\n\n👋 Program dihentikan. Sampai jumpa!")
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print("\n[INFO] Program dihentikan.")
